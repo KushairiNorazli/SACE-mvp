@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+backend/venv/
+
+# Environment variables (contains API keys)
+.env
+backend/.env
+
+# Local databases
+backend/qdrant_local_db/
+backend/chroma_db/
+backend/uploads/
+
+# Logs
+*.jsonl
+validation_logs.jsonl
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
