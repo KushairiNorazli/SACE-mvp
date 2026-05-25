@@ -3,6 +3,7 @@ import json
 import uuid
 import base64
 import requests
+import httpx
 import asyncio
 from typing import List, Optional
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -12,6 +13,14 @@ from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
+from agentic_auditor import (
+    AuditRequest, 
+    AuditResponse, 
+    generate_compliance_schema, 
+    extract_data_from_image, 
+    evaluate_compliance
+)
+
 load_dotenv() # Load variables from .env file into os.environ
 
 app = FastAPI(title="SACE MVP API", description="Sovereign Agentic Compliance Engine")
@@ -19,7 +28,7 @@ app = FastAPI(title="SACE MVP API", description="Sovereign Agentic Compliance En
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -54,7 +63,7 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Replace with the actual URL provided by your API endpoints
-COLPALI_API_URL = os.getenv("COLPALI_API_URL", "https://your-ngrok-id.ngrok-free.app/embed")
+COLPALI_API_URL = os.getenv("COLPALI_API_URL", "https://overflow-tweak-wistful.ngrok-free.dev/embed_pdf")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest") # e.g. "gemma-4" as desired
 
@@ -120,6 +129,222 @@ def query_gemini_vision(base64_image: str, prompt: str):
         raise HTTPException(status_code=response.status_code, detail=response.text)
 
 
+def query_gemini_for_structured_table(base64_data: str, mime_type: str, intent_query: str):
+    """
+    Calls the Gemini API to extract a structured table from a base64 document (PDF or image).
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        # Mock response if key is missing
+        return {
+            "table_title": "Mock Lab Test Results (Add GEMINI_API_KEY to test)",
+            "headers": ["Test Parameter", "Observed Value", "Reference Range", "Status"],
+            "rows": [
+                {"Test Parameter": "Hemoglobin", "Observed Value": "14.2", "Reference Range": "13.8 - 17.2", "Status": "Normal"},
+                {"Test Parameter": "White Blood Cells", "Observed Value": "11.5", "Reference Range": "4.5 - 11.0", "Status": "High"},
+                {"Test Parameter": "Platelets", "Observed Value": "250", "Reference Range": "150 - 450", "Status": "Normal"}
+            ],
+            "confidence_score": 0.95,
+            "summary": "Mock summary: White Blood Cells are slightly elevated (11.5). All other values are normal."
+        }
+
+    model = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    prompt = f"""
+You are an expert data extraction assistant specialized in medical device laboratory test reports.
+Your task is to locate and extract the compliance metrics from the document and return a valid JSON object matching this exact TypeScript interface:
+
+interface ExtractionResponse {{
+  mean_flow_rate_ml_hr: number;
+  mean_residual_volume_ml: number;
+  min_burst_pressure_mmHg: number;
+  qualitative_notes: string;
+}}
+
+CRITICAL EXTRACTION INSTRUCTIONS:
+1. You must extract the raw float or integer values from the document into the specific keys: 'mean_flow_rate_ml_hr', 'mean_residual_volume_ml', and 'min_burst_pressure_mmHg'.
+2. The values for all metric fields ('mean_flow_rate_ml_hr', 'mean_residual_volume_ml', 'min_burst_pressure_mmHg') MUST be raw integers or floats only. Do NOT include units (like 'mmHg' or 'mL'), text, status words, labels, or qualitative observations inside these metric value fields. For example, if a pressure is '1415 mmHg', you must return exactly 1415 as a number type, not a string.
+3. Put all 'PASS/FAIL' status labels, text summaries, unit annotations, and other qualitative descriptions strictly into the 'qualitative_notes' string field. Ensure that the 'qualitative_notes' string acts as a comprehensive string list/array representation detailing all qualitative observations and PASS/FAIL logs from the document.
+4. If a specific metric is not found in the document, return 0 as its numeric value.
+
+User's Intent/Extraction Guide: "{intent_query}"
+"""
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": base64_data
+                        }
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "mean_flow_rate_ml_hr": {"type": "NUMBER"},
+                    "mean_residual_volume_ml": {"type": "NUMBER"},
+                    "min_burst_pressure_mmHg": {"type": "NUMBER"},
+                    "qualitative_notes": {"type": "STRING"}
+                },
+                "required": [
+                    "mean_flow_rate_ml_hr",
+                    "mean_residual_volume_ml",
+                    "min_burst_pressure_mmHg",
+                    "qualitative_notes"
+                ]
+            }
+        }
+    }
+    
+    try:
+        response = requests.post(api_url, headers=headers, json=payload)
+        if response.status_code == 200:
+            data = response.json()
+            content = data["candidates"][0]["content"]["parts"][0]["text"]
+            content_str = content.strip()
+            if content_str.startswith("```"):
+                # strip out markdown block if present
+                lines = content_str.split("\n")
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                content_str = "\n".join(lines).strip()
+            
+            try:
+                # 1. Try loading with strict=False to bypass unescaped control chars (e.g. raw newlines/tabs in LLM text)
+                gemini_json = json.loads(content_str, strict=False)
+                
+                # Check if it has the mean_flow_rate_ml_hr key, which means it returned the strict interface object
+                if isinstance(gemini_json, dict) and ("mean_flow_rate_ml_hr" in gemini_json or "min_burst_pressure_mmHg" in gemini_json):
+                    wrapped_data = {
+                        "table_title": "Structured Elastomeric Infusion Device Ingress",
+                        "headers": ["mean_flow_rate_ml_hr", "mean_residual_volume_ml", "min_burst_pressure_mmHg", "qualitative_notes"],
+                        "rows": [
+                            {
+                                "mean_flow_rate_ml_hr": gemini_json.get("mean_flow_rate_ml_hr", 0),
+                                "mean_residual_volume_ml": gemini_json.get("mean_residual_volume_ml", 0),
+                                "min_burst_pressure_mmHg": gemini_json.get("min_burst_pressure_mmHg", 0),
+                                "qualitative_notes": gemini_json.get("qualitative_notes", "")
+                            }
+                        ],
+                        "confidence_score": 0.98,
+                        "summary": gemini_json.get("qualitative_notes", "Clean numerical device compliance parameters extracted.")
+                    }
+                    return wrapped_data
+                
+                return gemini_json
+            except Exception as parse_err:
+                safe_err = str(parse_err).encode('utf-8', errors='replace').decode('utf-8')
+                safe_content = content_str.encode('utf-8', errors='replace').decode('utf-8')
+                print("Initial JSON parsing failed. Attempting cleanup... Error:", safe_err)
+                print("Raw response content:")
+                print(safe_content)
+                
+                # 2. Attempt to clean trailing commas before closing brackets/braces
+                import re
+                cleaned_str = re.sub(r',\s*([\]}])', r'\1', content_str)
+                try:
+                    return json.loads(cleaned_str, strict=False)
+                except Exception:
+                    # Raise the original parsing error to show clear trace
+                    raise parse_err
+        else:
+            raise HTTPException(status_code=response.status_code, detail=f"Gemini API returned: {response.text}")
+    except Exception as e:
+        safe_e = str(e).encode('utf-8', errors='replace').decode('utf-8')
+        print(f"Error querying Gemini: {safe_e}")
+        raise HTTPException(status_code=500, detail=f"Failed to query Gemini API: {safe_e}")
+
+
+@app.post("/api/extract-lab-table")
+async def extract_lab_table(
+    file: UploadFile = File(...),
+    query: Optional[str] = Form("")
+):
+    try:
+        file_bytes = await file.read()
+        
+        mime_type = file.content_type
+        if not mime_type:
+            filename = file.filename.lower()
+            if filename.endswith(".pdf"):
+                mime_type = "application/pdf"
+            elif filename.endswith(".png"):
+                mime_type = "image/png"
+            elif filename.endswith(".jpg") or filename.endswith(".jpeg"):
+                mime_type = "image/jpeg"
+            else:
+                mime_type = "application/octet-stream"
+        
+        base64_data = base64.b64encode(file_bytes).decode("utf-8")
+        
+        extracted_data = query_gemini_for_structured_table(
+            base64_data=base64_data,
+            mime_type=mime_type,
+            intent_query=query
+        )
+        
+        # Include base64_image back for visual feedback if it is an image
+        # If it is a PDF, we can also display it in the client
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "mime_type": mime_type,
+            "image_base64": base64_data if mime_type.startswith("image/") else None,
+            "data": extracted_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+async def send_to_colpali(file: UploadFile, ngrok_url: str):
+    # 1. Read the file bytes from the frontend upload
+    # Note: If already read, we need to seek(0), but we will remove the read() from the caller.
+    pdf_bytes = await file.read()
+    
+    # 2. Set an aggressive timeout (e.g., 10 minutes = 600 seconds)
+    # Or use None to completely disable the timeout
+    timeout = httpx.Timeout(600.0) 
+    
+    # 3. Use httpx to asynchronously send the file
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # ngrok_url in .env already has /embed_pdf, so we just use it directly
+        files = {'file': (file.filename, pdf_bytes, file.content_type)}
+        
+        try:
+            print(f"Sending {file.filename} to ColPali Engine...")
+            response = await client.post(ngrok_url, files=files)
+            
+            # Check if the server crashed
+            response.raise_for_status() 
+            
+            # Return the embeddings and base64 images
+            return response.json()
+            
+        except httpx.ReadTimeout:
+            print("ERROR: ColPali took longer than 10 minutes to process the file.")
+            return None
+        except Exception as e:
+            print(f"ERROR connecting to GPU: {e}")
+            return None
+
 @app.get("/")
 def read_root():
     return {"status": "SACE Engine Running"}
@@ -128,26 +353,16 @@ def read_root():
 async def upload_document(file: UploadFile = File(...)):
     doc_id = str(uuid.uuid4())
     
-    # Read the raw PDF bytes from the upload
-    pdf_bytes = await file.read()
-    
-    # Send the PDF to the external ColPali API for embedding
+    # Send the PDF to the external ColPali API for embedding using the new async client
     colpali_url = os.getenv("COLPALI_API_URL")
     if not colpali_url:
         raise HTTPException(status_code=500, detail="COLPALI_API_URL is not configured in .env")
     
-    try:
-        colpali_response = requests.post(
-            colpali_url,
-            files={"file": (file.filename, pdf_bytes, "application/pdf")},
-            headers={"ngrok-skip-browser-warning": "true"},
-            timeout=120
-        )
-        colpali_response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Failed to reach ColPali API: {str(e)}")
+    colpali_data = await send_to_colpali(file, colpali_url)
     
-    colpali_data = colpali_response.json()
+    if not colpali_data:
+        raise HTTPException(status_code=502, detail="Failed to reach ColPali API or processing timed out.")
+    
     embeddings = colpali_data.get("embeddings", [])
     base64_images = colpali_data.get("base64_images", [])
     
@@ -247,3 +462,33 @@ async def validate_metric(req: ValidateRequest):
         f.write(json.dumps(log_entry) + "\n")
         
     return {"status": "logged", "feedback_recorded": True}
+
+@app.post("/api/audit", response_model=AuditResponse)
+async def run_agentic_auditor_pipeline(request: AuditRequest):
+    """
+    End-to-End Pipeline execution endpoint integrated from Agentic Auditor module.
+    """
+    try:
+        # Phase 1
+        dynamic_schema = generate_compliance_schema(
+            user_prompt=request.user_prompt, 
+            compliance_rule_text=request.compliance_rule_text
+        )
+        
+        # Phase 2
+        extracted_data = extract_data_from_image(
+            image_path=request.image_path, 
+            dynamic_schema=dynamic_schema
+        )
+        
+        # Phases 3 & 4
+        evaluation_result = evaluate_compliance(
+            extracted_data=extracted_data, 
+            compliance_rule_bounds=request.compliance_rule_bounds
+        )
+        
+        return AuditResponse(**evaluation_result)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
